@@ -1250,6 +1250,40 @@ class TestIncomingDocumentHandling:
         assert msg_event.media_types == ["application/pdf"]
 
     @pytest.mark.asyncio
+    async def test_forwarded_message_nested_document_is_cached(self, adapter):
+        """Files nested in a Slack message unfurl use the normal media path."""
+        pdf_bytes = b"%PDF-1.4 forwarded content"
+
+        with patch.object(
+            adapter, "_download_slack_file_bytes", new_callable=AsyncMock
+        ) as dl:
+            dl.return_value = pdf_bytes
+            event = self._make_event(
+                text="Please inspect the forwarded file",
+                attachments=[
+                    {
+                        "is_msg_unfurl": True,
+                        "text": "Original request",
+                        "files": [
+                            {
+                                "id": "F_FORWARDED",
+                                "mimetype": "application/pdf",
+                                "name": "forwarded.pdf",
+                                "url_private_download": "https://files.slack.com/forwarded.pdf",
+                                "size": len(pdf_bytes),
+                            }
+                        ],
+                    }
+                ],
+            )
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.DOCUMENT
+        assert len(msg_event.media_urls) == 1
+        assert msg_event.media_types == ["application/pdf"]
+
+    @pytest.mark.asyncio
     async def test_txt_document_injects_content(self, adapter):
         """A .txt file under 100KB should have its content injected into event text."""
         content = b"Hello from a text file"
@@ -1665,15 +1699,16 @@ class TestIncomingDocumentHandling:
         assert "_Notion_" in msg_event.text
 
     @pytest.mark.asyncio
-    async def test_message_unfurl_attachments_are_skipped(self, adapter):
-        """Message unfurls should be skipped to avoid echoing Slack message copies."""
+    async def test_forwarded_message_unfurl_text_is_appended(self, adapter):
+        """Forwarded Slack message text must be visible to the agent."""
         event = self._make_event(
-            text="https://example.com/thread",
+            text="Why did this fail?",
             attachments=[
                 {
                     "is_msg_unfurl": True,
-                    "title": "Thread copy",
-                    "text": "This should not be appended",
+                    "title": "Fabe EA",
+                    "from_url": "https://example.slack.com/archives/C1/p123",
+                    "text": "No Codex credentials stored.",
                 }
             ],
         )
@@ -1681,7 +1716,40 @@ class TestIncomingDocumentHandling:
         await adapter._handle_slack_message(event)
 
         msg_event = adapter.handle_message.call_args[0][0]
-        assert msg_event.text == "https://example.com/thread"
+        assert "Why did this fail?" in msg_event.text
+        assert "Forwarded Slack message" in msg_event.text
+        assert "No Codex credentials stored." in msg_event.text
+        assert "https://example.slack.com/archives/C1/p123" in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_forwarded_message_unfurl_uses_nested_block_text(self, adapter):
+        """Slack may put forwarded text in attachment blocks instead of text."""
+        event = self._make_event(
+            text="Please diagnose",
+            attachments=[
+                {
+                    "is_msg_unfurl": True,
+                    "blocks": [
+                        {
+                            "type": "rich_text",
+                            "elements": [
+                                {
+                                    "type": "rich_text_section",
+                                    "elements": [
+                                        {"type": "text", "text": "Original forwarded body"}
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        )
+
+        await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "Original forwarded body" in msg_event.text
 
     @pytest.mark.asyncio
     async def test_channel_routing_ignores_bot_mentions_inside_block_text(

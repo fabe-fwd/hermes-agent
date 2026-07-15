@@ -2671,10 +2671,10 @@ class SlackAdapter(BasePlatformAdapter):
             if blocks_payload:
                 text = (text.strip() + "\n\n" + blocks_payload).strip()
 
-        # Extract link unfurls / rich attachments (e.g. Notion previews).
-        # Slack places unfurled link previews in the ``attachments`` array with
-        # fields like title, title_link/from_url, text, footer, and fallback.
-        # Without reading these, the agent never sees shared link previews.
+        # Extract link unfurls / rich attachments (e.g. Notion previews and
+        # forwarded Slack messages). Slack represents a forwarded message as an
+        # ``is_msg_unfurl`` attachment; its original text is not guaranteed to
+        # appear in the event's top-level ``text`` or ``blocks`` fields.
         slack_attachments = event.get("attachments") or []
         if slack_attachments:
             att_parts: list[str] = []
@@ -2684,14 +2684,26 @@ class SlackAdapter(BasePlatformAdapter):
                 att_text = att.get("text", "")
                 att_footer = att.get("footer", "")
                 att_fallback = att.get("fallback", "")
+                is_message_unfurl = bool(att.get("is_msg_unfurl"))
 
-                # Skip message-type attachments (e.g. Slack bot messages with
-                # is_msg_unfurl) to avoid echoing our own content.
-                if att.get("is_msg_unfurl"):
-                    continue
+                # Some Slack clients put the forwarded message body in nested
+                # Block Kit instead of ``text``. The attachment is context
+                # only: mention/command routing was already decided from the
+                # human's top-level message, so forwarded content cannot wake a
+                # bot or execute a quoted command.
+                if is_message_unfurl and not att_text:
+                    att_text = _extract_text_from_slack_blocks(att.get("blocks") or [])
 
                 # Build a readable representation.
-                if att_title and att_url:
+                if is_message_unfurl and att_title and att_url:
+                    header = f"📨 Forwarded Slack message: [{att_title}]({att_url})"
+                elif is_message_unfurl and att_title:
+                    header = f"📨 Forwarded Slack message: {att_title}"
+                elif is_message_unfurl and att_url:
+                    header = f"📨 Forwarded Slack message: {att_url}"
+                elif is_message_unfurl:
+                    header = "📨 Forwarded Slack message"
+                elif att_title and att_url:
                     header = f"📎 [{att_title}]({att_url})"
                 elif att_title:
                     header = f"📎 {att_title}"
@@ -2731,10 +2743,7 @@ class SlackAdapter(BasePlatformAdapter):
             if att_parts:
                 attachment_text = "\n\n".join(att_parts)
                 text = (text.strip() + "\n\n" + attachment_text).strip()
-                logger.debug(
-                    "Slack: appended %d link unfurl(s) to message text",
-                    len(att_parts),
-                )
+                logger.debug("Slack: appended %d attachment unfurl(s) to message text", len(att_parts))
 
         channel_id = event.get("channel", "")
         ts = event.get("ts", "")
@@ -2908,7 +2917,20 @@ class SlackAdapter(BasePlatformAdapter):
         media_urls = []
         media_types = []
         attachment_notices: List[str] = []
-        files = event.get("files", [])
+        files = list(event.get("files") or [])
+
+        # Forwarded Slack messages keep original files under
+        # ``attachments[].files`` rather than top-level ``event.files``.
+        # Promote and de-duplicate them into the existing download path.
+        seen_file_ids = {f.get("id") for f in files if f.get("id")}
+        for attachment in slack_attachments:
+            for nested_file in attachment.get("files") or []:
+                nested_id = nested_file.get("id")
+                if nested_id and nested_id in seen_file_ids:
+                    continue
+                files.append(nested_file)
+                if nested_id:
+                    seen_file_ids.add(nested_id)
         for f in files:
             # Slack Connect channels return stub file objects with
             # file_access="check_file_info" and no URL fields. We must
