@@ -486,6 +486,35 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # Tearing down a wedged (half-open) Socket Mode connection can block
+        # indefinitely inside the aiohttp websocket close handshake. Reconnects
+        # are driven from a single watchdog loop, so an unbounded close would
+        # wedge the whole self-healing path — hence a hard budget after which a
+        # stuck close is abandoned to the background and the rebuild proceeds.
+        self._socket_close_timeout_s = 5.0
+        self._detached_close_tasks: set = set()
+        # Bounded exponential backoff for *consecutive* failed reconnects,
+        # mirroring the yuanbao adapter's ``min(2 ** attempt, cap)`` convention.
+        # Reset to 0 whenever the watchdog observes a healthy transport, so an
+        # isolated drop reconnects immediately (no penalty for the common case).
+        self._reconnect_attempts = 0
+        self._reconnect_backoff_base_s = 1.0
+        self._reconnect_backoff_cap_s = 30.0
+
+    def _reconnect_backoff_delay(self) -> float:
+        """Seconds to wait before the next reconnect, from the failure streak.
+
+        ``0`` for the first attempt after a healthy period; then
+        ``base, 2*base, 4*base, …`` capped at ``cap`` — the same bounded
+        exponential shape used elsewhere in the gateway (see
+        ``gateway/platforms/yuanbao.py``).
+        """
+        if self._reconnect_attempts <= 0:
+            return 0.0
+        return min(
+            self._reconnect_backoff_base_s * (2.0 ** (self._reconnect_attempts - 1)),
+            self._reconnect_backoff_cap_s,
+        )
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -502,32 +531,72 @@ class SlackAdapter(BasePlatformAdapter):
         task.add_done_callback(self._on_socket_mode_task_done)
 
     async def _stop_socket_mode_handler(self) -> None:
-        """Stop Socket Mode handler and task."""
+        """Stop the Socket Mode handler and task, never blocking on a wedged close.
+
+        ``handler.close_async()`` closes slack_sdk's long-lived aiohttp session;
+        on a half-open websocket that close can hang inside the aiohttp close
+        handshake. We time-box it: if the close overruns ``_socket_close_timeout_s``
+        the still-running close is *detached* (left to finish in the background
+        when the OS finally tears the socket down) so the caller — the single
+        watchdog/reconnect loop — is free to build a fresh handler immediately.
+        Detaching rather than cancelling lets slack_sdk finish releasing its own
+        monitor/receiver tasks instead of leaving them half-torn-down.
+        """
         handler = self._handler
         task = self._socket_mode_task
         self._handler = None
         self._socket_mode_task = None
 
         if handler is not None:
-            try:
-                await handler.close_async()
-            except Exception as e:  # pragma: no cover - defensive logging
+            close_task = asyncio.ensure_future(self._safe_close_handler(handler))
+            _done, pending = await asyncio.wait(
+                {close_task}, timeout=self._socket_close_timeout_s
+            )
+            if close_task in pending:
                 logger.warning(
-                    "[Slack] Error while closing Socket Mode handler: %s",
-                    e,
-                    exc_info=True,
+                    "[Slack] Socket Mode handler close exceeded %ss; abandoning the "
+                    "wedged handler and continuing reconnect with a fresh session",
+                    self._socket_close_timeout_s,
                 )
+                # Hold a reference so the detached close isn't garbage-collected
+                # mid-flight; drop it once it eventually completes.
+                self._detached_close_tasks.add(close_task)
+                close_task.add_done_callback(self._detached_close_tasks.discard)
 
         if task is not None and not task.done():
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:  # pragma: no cover - defensive logging
-                logger.debug(
-                    "[Slack] Socket Mode task failed while stopping", exc_info=True
+            _done, pending = await asyncio.wait(
+                {task}, timeout=self._socket_close_timeout_s
+            )
+            if task in pending:
+                logger.warning(
+                    "[Slack] Socket Mode task did not stop within %ss; abandoning it",
+                    self._socket_close_timeout_s,
                 )
+            else:
+                # Surface (and swallow) a non-cancellation error so it isn't
+                # reported as an unretrieved task exception.
+                if not task.cancelled():
+                    exc = task.exception()
+                    if exc is not None:
+                        logger.debug(
+                            "[Slack] Socket Mode task failed while stopping: %s",
+                            exc,
+                            exc_info=exc,
+                        )
+
+    async def _safe_close_handler(self, handler: Any) -> None:
+        """Close a Socket Mode handler, logging (not raising) any close error."""
+        try:
+            await handler.close_async()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover - defensive logging
+            logger.warning(
+                "[Slack] Error while closing Socket Mode handler: %s",
+                e,
+                exc_info=True,
+            )
 
     async def _socket_transport_connected(self) -> Optional[bool]:
         """Best-effort check of current Socket Mode transport state."""
@@ -551,7 +620,14 @@ class SlackAdapter(BasePlatformAdapter):
             return None
 
     async def _restart_socket_mode(self, reason: str) -> None:
-        """Reconnect Socket Mode without rebuilding adapter state."""
+        """Reconnect Socket Mode with a fresh handler, serialized and backed off.
+
+        The ``_socket_reconnect_lock`` collapses a burst of disconnect signals
+        (watchdog probe + task-done callback) into one reconnect at a time, and
+        the bounded exponential backoff prevents a tight retry loop when the
+        rebuild keeps failing fast. ``_reconnect_attempts`` is reset by the
+        watchdog once the transport is healthy again.
+        """
         if not self._running:
             return
 
@@ -559,7 +635,20 @@ class SlackAdapter(BasePlatformAdapter):
             if not self._running or not self._app or not self._app_token:
                 return
 
+            delay = self._reconnect_backoff_delay()
+            if delay > 0:
+                logger.warning(
+                    "[Slack] Backing off %.1fs before reconnect attempt %d (%s)",
+                    delay,
+                    self._reconnect_attempts + 1,
+                    reason,
+                )
+                await asyncio.sleep(delay)
+                if not self._running:
+                    return
+
             logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
+            self._reconnect_attempts += 1
             await self._stop_socket_mode_handler()
 
             try:
@@ -568,6 +657,10 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.error(
                     "[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True
                 )
+
+    def _note_socket_healthy(self) -> None:
+        """Clear the reconnect backoff once a live transport is observed."""
+        self._reconnect_attempts = 0
 
     async def _socket_watchdog_loop(self) -> None:
         """Monitor Socket Mode and reconnect if the task/transport dies.
@@ -594,6 +687,8 @@ class SlackAdapter(BasePlatformAdapter):
                 connected = await self._socket_transport_connected()
                 if connected is False:
                     await self._restart_socket_mode("transport disconnected")
+                elif connected is True:
+                    self._note_socket_healthy()
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -1246,6 +1341,8 @@ class SlackAdapter(BasePlatformAdapter):
             try:
                 self._start_socket_mode_handler()
                 self._running = True
+                # Fresh connect starts a clean reconnect-backoff streak.
+                self._reconnect_attempts = 0
                 self._ensure_socket_watchdog()
             except Exception:
                 self._running = False
@@ -1334,6 +1431,14 @@ class SlackAdapter(BasePlatformAdapter):
                 )
 
         await self._stop_socket_mode_handler()
+        self._reconnect_attempts = 0
+
+        # Cancel any detached handler-close tasks left over from wedged
+        # reconnects — the platform is going down, so we don't wait on them.
+        for close_task in list(self._detached_close_tasks):
+            close_task.cancel()
+        self._detached_close_tasks.clear()
+
         self._app = None
         self._app_token = None
         self._proxy_url = None

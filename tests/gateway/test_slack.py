@@ -665,6 +665,188 @@ class TestSlackSocketWatchdog:
 
 
 # ---------------------------------------------------------------------------
+# TestSlackReconnectRobustness
+# ---------------------------------------------------------------------------
+
+
+class TestSlackReconnectRobustness:
+    """Regression coverage for the "Session is closed" reconnect P0.
+
+    slack_sdk's ``SocketModeClient`` reuses one long-lived ``aiohttp`` session
+    for its internal auto-reconnect; once that session is closed the internal
+    ``connect()`` loop spins forever on ``RuntimeError: Session is closed`` and
+    cannot self-heal. The gateway self-heals by rebuilding the handler with a
+    fresh session — but the rebuild must never (a) block on a wedged old handler
+    whose close hangs, nor (b) hammer Slack in a tight retry loop. Both would
+    leave the process alive-but-dead, recoverable only by a container restart
+    (incident 20260718T034701Z).
+    """
+
+    def _patch_stack(self, fake_factory):
+        mock_app = MagicMock()
+
+        def _noop_decorator(_):
+            def decorator(fn):
+                return fn
+
+            return decorator
+
+        mock_app.event = _noop_decorator
+        mock_app.command = _noop_decorator
+        mock_app.action = _noop_decorator
+        mock_app.client = AsyncMock()
+
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(
+            return_value={
+                "user_id": "U_BOT",
+                "user": "testbot",
+                "team_id": "T_FAKE",
+                "team": "FakeTeam",
+            }
+        )
+
+        return [
+            patch.object(_slack_mod, "AsyncApp", return_value=mock_app),
+            patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client),
+            patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}),
+            patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
+            patch("gateway.status.release_scoped_lock"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_reconnect_recovers_when_stale_handler_close_hangs(self):
+        """A wedged old handler (its close never returns) must not block the
+        rebuild. The watchdog has to abandon the dead handler and bring up a
+        fresh one — the whole point of self-healing without a restart."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.01
+        adapter._socket_close_timeout_s = 0.05  # abandon a wedged close quickly
+
+        instances = []
+
+        class WedgedFirstCloseHandler:
+            def __init__(self, app, app_token, proxy=None):
+                self.app = app
+                self.client = MagicMock()
+                self.client.is_connected = lambda: True
+                self._start = asyncio.Event()
+                self.closed = False
+                self.start_calls = 0
+                # Only the first handler models the half-open, wedged close.
+                self._hang_close = len(instances) == 0
+                instances.append(self)
+
+            async def start_async(self):
+                self.start_calls += 1
+                await self._start.wait()
+
+            async def close_async(self):
+                if self._hang_close:
+                    await asyncio.Event().wait()  # never returns
+                self.closed = True
+                self._start.set()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(WedgedFirstCloseHandler):
+                stack.enter_context(p)
+            stack.enter_context(
+                patch.object(
+                    _slack_mod, "AsyncSocketModeHandler", WedgedFirstCloseHandler
+                )
+            )
+
+            try:
+                assert await adapter.connect() is True
+                assert len(instances) == 1
+                instances[0]._start.set()
+
+                # The first handler is now wedged: unhealthy, and its close hangs.
+                instances[0].client.is_connected = lambda: False
+
+                healed = False
+                for _ in range(200):  # ~2s budget
+                    await asyncio.sleep(0.01)
+                    if len(instances) >= 2 and adapter._handler is instances[-1]:
+                        healed = True
+                        break
+
+                assert healed, (
+                    "reconnect blocked on a wedged handler close — the gateway "
+                    "would need a process restart to recover"
+                )
+                # The replacement is a *fresh* handler (fresh aiohttp session).
+                assert adapter._handler is instances[-1]
+                assert instances[-1] is not instances[0]
+                assert instances[-1].start_calls == 1
+            finally:
+                await asyncio.wait_for(adapter.disconnect(), timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_repeated_fast_reconnects_are_bounded_by_backoff(self):
+        """A handler that keeps failing fast must not spin the reconnect loop —
+        backoff has to throttle it to a small number of attempts per window."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 9999  # isolate the done-callback path
+        adapter._reconnect_backoff_base_s = 0.05
+        adapter._reconnect_backoff_cap_s = 0.1
+
+        instances = []
+
+        class FastFailHandler:
+            def __init__(self, app, app_token, proxy=None):
+                self.client = MagicMock()
+                self.client.is_connected = lambda: False
+                self.closed = False
+                instances.append(self)
+
+            async def start_async(self):
+                return  # completes at once -> done-callback schedules a restart
+
+            async def close_async(self):
+                self.closed = True
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(FastFailHandler):
+                stack.enter_context(p)
+            stack.enter_context(
+                patch.object(_slack_mod, "AsyncSocketModeHandler", FastFailHandler)
+            )
+
+            try:
+                assert await adapter.connect() is True
+                await asyncio.sleep(0.3)
+                # Without backoff this loop creates hundreds/thousands of handlers.
+                assert len(instances) <= 25, (
+                    f"reconnect tight-loop not throttled: {len(instances)} handlers "
+                    "created in 0.3s"
+                )
+            finally:
+                adapter._running = False
+                await asyncio.sleep(0.15)
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_backoff_is_exponential_and_resets_on_health(self):
+        """Backoff mirrors the codebase convention (min(base*2**n, cap)); the
+        first reconnect after a healthy period is immediate (no penalty)."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._reconnect_backoff_base_s = 1.0
+        adapter._reconnect_backoff_cap_s = 30.0
+
+        adapter._reconnect_attempts = 0
+        assert adapter._reconnect_backoff_delay() == 0.0  # isolated drop = instant
+        adapter._reconnect_attempts = 1
+        assert adapter._reconnect_backoff_delay() == 1.0
+        adapter._reconnect_attempts = 2
+        assert adapter._reconnect_backoff_delay() == 2.0
+        adapter._reconnect_attempts = 3
+        assert adapter._reconnect_backoff_delay() == 4.0
+        adapter._reconnect_attempts = 20
+        assert adapter._reconnect_backoff_delay() == 30.0  # capped
+
+
+# ---------------------------------------------------------------------------
 # TestSlackProxyBehavior
 # ---------------------------------------------------------------------------
 

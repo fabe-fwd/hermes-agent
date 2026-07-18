@@ -637,7 +637,8 @@ Notes:
 | Bot responds but can't post in a channel | Invite the bot to the channel with `/invite @Hermes Agent` |
 | Bot can chat but can't read uploaded images/files | Add `files:read`, then **reinstall** the app. Hermes now surfaces attachment access diagnostics in-chat when Slack returns scope/auth/permission failures. |
 | `missing_scope` error | Add the required scope in OAuth & Permissions, then **reinstall** the app |
-| Socket disconnects frequently | Check your network; Bolt auto-reconnects but unstable connections cause lag |
+| Socket disconnects frequently | Check your network; Bolt auto-reconnects but unstable connections cause lag. Hermes also runs its own Socket Mode watchdog that rebuilds the connection with a **fresh** session if Bolt's built-in reconnect gets stuck, so the gateway self-heals without a restart. |
+| Logs show repeated `RuntimeError: Session is closed` / `Failed to connect (error: Session is closed); Retrying...` | The underlying `aiohttp` session was closed and Bolt's internal reconnect can't reuse it. Hermes' watchdog detects this and rebuilds Socket Mode with a fresh session automatically (bounded backoff between attempts); no container restart needed. If it persists, check network/proxy reachability to `slack.com`. |
 | Changed scopes/events but nothing changed | You **must reinstall** the app to your workspace after any scope or event subscription change |
 
 ### Quick Checklist
