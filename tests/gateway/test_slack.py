@@ -486,6 +486,42 @@ class TestSlackSocketWatchdog:
                 await adapter.disconnect()
 
     @pytest.mark.asyncio
+    async def test_watchdog_rebuilds_when_sdk_session_closed_but_socket_looks_live(
+        self,
+    ):
+        """Regression for incident 20260729T030101Z: slack_sdk kept its
+        background task alive and ``is_connected()`` true while its shared
+        aiohttp session was closed, so the original watchdog never rebuilt."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.01
+        factory, instances = self._make_fake_handler_factory()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                assert len(instances) == 1
+
+                instances[0].client.is_connected = lambda: True
+                instances[0].client.aiohttp_client_session.closed = True
+
+                for _ in range(40):
+                    if len(instances) >= 2:
+                        break
+                    await asyncio.sleep(0.01)
+
+                assert len(instances) >= 2, (
+                    "watchdog trusted the websocket's stale connected flag "
+                    "instead of rebuilding the closed SDK session"
+                )
+                assert instances[0].closed is True
+                assert adapter._handler is instances[-1]
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
     async def test_disconnect_stops_watchdog_and_does_not_reconnect(self):
         adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
         adapter._socket_watchdog_interval_s = 0.01
@@ -713,6 +749,20 @@ class TestSlackReconnectRobustness:
             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
             patch("gateway.status.release_scoped_lock"),
         ]
+
+    @pytest.mark.asyncio
+    async def test_transport_probe_rejects_closed_sdk_client_session(self):
+        """The SDK websocket can claim it is connected after its shared
+        aiohttp session has closed. The underlying session flag must win or
+        the watchdog never reaches the fresh-handler rebuild path."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        sdk_client = MagicMock()
+        sdk_client.is_connected = AsyncMock(return_value=True)
+        sdk_client.aiohttp_client_session.closed = True
+        adapter._handler = MagicMock(client=sdk_client)
+
+        assert await adapter._socket_transport_connected() is False
+        sdk_client.is_connected.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_reconnect_recovers_when_stale_handler_close_hangs(self):

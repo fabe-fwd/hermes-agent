@@ -604,6 +604,16 @@ class SlackAdapter(BasePlatformAdapter):
         if client is None:
             return None
 
+        # slack_sdk can leave ``current_session`` looking live while the
+        # long-lived aiohttp ClientSession underneath it is already closed.
+        # In that state ``is_connected()`` may still return True, but every
+        # internal reconnect attempt fails forever with "Session is closed".
+        # Treat the concrete SDK session flag as authoritative so our watchdog
+        # rebuilds the whole handler (and therefore creates a fresh session).
+        aiohttp_session = getattr(client, "aiohttp_client_session", None)
+        if getattr(aiohttp_session, "closed", None) is True:
+            return False
+
         state = getattr(client, "is_connected", None)
         if state is None:
             return None
