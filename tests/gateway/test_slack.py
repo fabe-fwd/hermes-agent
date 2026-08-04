@@ -895,6 +895,114 @@ class TestSlackReconnectRobustness:
         adapter._reconnect_attempts = 20
         assert adapter._reconnect_backoff_delay() == 30.0  # capped
 
+    @pytest.mark.asyncio
+    async def test_stop_handler_reaps_sdk_tasks_that_survive_close(self):
+        """Regression for incident 20260803T185201Z: slack_sdk's ``connect()``
+        retry loop never rechecks ``closed``, and the one cancel its ``close()``
+        issues can land mid-``ws_connect``, where aiohttp converts it into
+        ``ClientConnectionError`` — swallowed by the loop's bare ``except``.
+        The surviving task then retries the closed session forever ("Session is
+        closed" every ping interval), flooding gateway.log until the host guard
+        restarts a healthy gateway. Stopping a handler must leave the SDK's
+        internal futures actually done, even when the first cancel is eaten."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._running = True
+
+        async def zombie_connect_loop():
+            swallowed_once = False
+            while True:
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    if not swallowed_once:
+                        swallowed_once = True
+                        continue  # aiohttp ate the first cancel mid-connect
+                    raise
+
+        monitor = asyncio.get_event_loop().create_task(zombie_connect_loop())
+        await asyncio.sleep(0)  # let the zombie reach its await
+
+        sdk_client = MagicMock()
+        sdk_client.closed = False
+        sdk_client.auto_reconnect_enabled = True
+        sdk_client.default_auto_reconnect_enabled = True
+        sdk_client.current_session_monitor = monitor
+        sdk_client.message_receiver = None
+        sdk_client.message_processor = None
+
+        handler = MagicMock()
+        handler.client = sdk_client
+        handler.close_async = AsyncMock()  # close "succeeds" but leaves the task
+
+        adapter._handler = handler
+        adapter._socket_mode_task = None
+
+        try:
+            await asyncio.wait_for(adapter._stop_socket_mode_handler(), timeout=5.0)
+
+            assert monitor.done(), (
+                "SDK monitor task survived handler stop — it would spam "
+                "'Session is closed' forever and trip the host guard"
+            )
+            assert sdk_client.closed is True
+            assert sdk_client.auto_reconnect_enabled is False
+        finally:
+            for _ in range(10):  # zombie swallows one cancel; keep cancelling
+                if monitor.done():
+                    break
+                monitor.cancel()
+                await asyncio.wait({monitor}, timeout=0.05)
+
+    @pytest.mark.asyncio
+    async def test_watchdog_logs_slack_connected_marker_after_reconnect(
+        self, caplog
+    ):
+        """The host guard greps gateway.log's tail for the literal
+        "✓ slack connected" bytes. An in-process reconnect used to be silent on
+        success, so retry spam could scroll the startup marker out of the
+        guard's window and it restarted a healthy gateway. A recovery observed
+        by the watchdog must re-emit the marker (once per recovery)."""
+        import logging as _logging
+
+        caplog.set_level(_logging.INFO)
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._running = True
+        adapter._socket_watchdog_interval_s = 0.01
+        adapter._reconnect_attempts = 2  # a reconnect just happened
+
+        sdk_client = MagicMock()
+        sdk_client.aiohttp_client_session.closed = False
+        sdk_client.is_connected = lambda: True
+        adapter._handler = MagicMock(client=sdk_client)
+        adapter._socket_mode_task = asyncio.get_event_loop().create_task(
+            _pending_for_fake_task()
+        )
+
+        try:
+            adapter._ensure_socket_watchdog()
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                if "slack connected" in caplog.text:
+                    break
+
+            assert "✓ slack connected" in caplog.text, (
+                "healthy-after-reconnect was not logged — the host guard "
+                "cannot see in-process recoveries"
+            )
+            assert adapter._reconnect_attempts == 0
+
+            # Steady-state health must not spam the marker.
+            caplog.clear()
+            await asyncio.sleep(0.05)
+            assert "✓ slack connected" not in caplog.text
+        finally:
+            adapter._running = False
+            for task in (adapter._socket_watchdog_task, adapter._socket_mode_task):
+                if task is not None and not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
 
 # ---------------------------------------------------------------------------
 # TestSlackProxyBehavior

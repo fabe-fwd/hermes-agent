@@ -585,6 +585,70 @@ class SlackAdapter(BasePlatformAdapter):
                             exc_info=exc,
                         )
 
+        if handler is not None:
+            await self._reap_sdk_client_tasks(getattr(handler, "client", None))
+
+    # slack_sdk internal futures that its ``close()`` cancels exactly once.
+    _SDK_INTERNAL_FUTURES = (
+        "current_session_monitor",
+        "message_receiver",
+        "message_processor",
+    )
+    _sdk_reap_rounds = 6
+    _sdk_reap_round_wait_s = 0.1
+
+    async def _reap_sdk_client_tasks(self, client: Any) -> None:
+        """Force a stopped SDK client's internal tasks dead (incident 20260803T185201Z).
+
+        slack_sdk's ``SocketModeClient.connect()`` retries in a ``while True``
+        that never rechecks ``closed``, and the single cancel its ``close()``
+        issues can land mid-``ws_connect`` — where aiohttp converts it into
+        ``ClientConnectionError("Connector is closed.")``, which that loop's
+        bare ``except Exception`` swallows. The surviving task then retries the
+        closed session forever, logging "Session is closed" every ping
+        interval until the spam scrolls the startup marker out of the host
+        guard's log window and it restarts a perfectly healthy gateway.
+
+        Re-cancel the SDK's tracked futures until they are actually done: a
+        zombie parks in ``asyncio.sleep(ping_interval)`` between retries, so a
+        fresh cancel lands there and is fatal.
+        """
+        if client is None:
+            return
+        # Also flip every exit condition the SDK *does* check, so loops that
+        # consult them (``monitor_current_session``, ``receive_messages``)
+        # exit on their own even if a cancel never lands.
+        for flag, value in (
+            ("closed", True),
+            ("auto_reconnect_enabled", False),
+            ("default_auto_reconnect_enabled", False),
+        ):
+            try:
+                setattr(client, flag, value)
+            except Exception:  # pragma: no cover - foreign client object
+                pass
+
+        pending = [
+            fut
+            for fut in (
+                getattr(client, name, None) for name in self._SDK_INTERNAL_FUTURES
+            )
+            if isinstance(fut, asyncio.Future) and not fut.done()
+        ]
+        for _ in range(self._sdk_reap_rounds):
+            if not pending:
+                return
+            for fut in pending:
+                fut.cancel()
+            await asyncio.wait(set(pending), timeout=self._sdk_reap_round_wait_s)
+            pending = [fut for fut in pending if not fut.done()]
+        if pending:
+            logger.warning(
+                "[Slack] %d SDK task(s) survived handler close and repeated "
+                "cancels; they may keep logging reconnect errors",
+                len(pending),
+            )
+
     async def _safe_close_handler(self, handler: Any) -> None:
         """Close a Socket Mode handler, logging (not raising) any close error."""
         try:
@@ -698,6 +762,14 @@ class SlackAdapter(BasePlatformAdapter):
                 if connected is False:
                     await self._restart_socket_mode("transport disconnected")
                 elif connected is True:
+                    if self._reconnect_attempts > 0:
+                        # First healthy probe after a reconnect. The host
+                        # guard's health check greps gateway.log's tail for
+                        # this exact "✓ slack connected" byte sequence — keep
+                        # in-process recoveries visible to it, or retry spam
+                        # can scroll the startup marker out of its window and
+                        # trigger a container restart of a healthy gateway.
+                        logger.info("✓ slack connected (socket mode reconnect)")
                     self._note_socket_healthy()
             except asyncio.CancelledError:
                 raise
