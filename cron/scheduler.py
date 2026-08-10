@@ -2261,18 +2261,34 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 # silent skip — do not pollute the prompt with error messages
 
     # Always prepend cron execution guidance so the agent knows how
-    # delivery works and can suppress delivery when appropriate.
-    cron_hint = (
-        "[IMPORTANT: You are running as a scheduled cron job. "
-        "DELIVERY: Your final response will be automatically delivered "
-        "to the user — do NOT use send_message or try to deliver "
-        "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
-        "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
-        "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
-    )
+    # delivery works for THIS job's deliver mode. A deliver=local job's
+    # final response is archived only — telling it delivery is automatic
+    # (and forbidding send_message) made jobs whose prompts require an
+    # explicit send silently skip it (fleet incident 2026-08-04..08-10).
+    deliver_mode = _normalize_deliver_value(job.get("deliver", "local"))
+    if deliver_mode == "local":
+        cron_hint = (
+            "[IMPORTANT: You are running as a scheduled cron job. "
+            "DELIVERY: This job runs with deliver=local — your final "
+            "response is archived to the job's output directory only and "
+            "is NOT delivered to any chat, channel, or user. Nothing is "
+            "sent anywhere on your behalf. If this job's instructions "
+            "require sending a message or report somewhere, you must "
+            "perform that send yourself with the appropriate tool before "
+            "finishing — your final response alone will not reach anyone.]\n\n"
+        )
+    else:
+        cron_hint = (
+            "[IMPORTANT: You are running as a scheduled cron job. "
+            "DELIVERY: Your final response will be automatically delivered "
+            "to the user — do NOT use send_message or try to deliver "
+            "the output yourself. Just produce your report/output as your "
+            "final response and the system handles the rest. "
+            "SILENT: If there is genuinely nothing new to report, respond "
+            "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
+            "Never combine [SILENT] with content — either report your "
+            "findings normally, or say [SILENT] and nothing more.]\n\n"
+        )
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
@@ -3075,7 +3091,13 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+        # Stamp the job's delivery mode so the system-prompt cron hint
+        # matches reality (deliver=local archives only; anything else
+        # auto-delivers). Read by _default_platform_hint().
+        agent._cron_deliver_mode = _normalize_deliver_value(
+            job.get("deliver", "local")
+        )
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured

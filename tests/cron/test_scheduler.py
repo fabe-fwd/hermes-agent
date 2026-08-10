@@ -2670,34 +2670,49 @@ class TestOneShotDispatchClaim:
 
 
 class TestBuildJobPromptSilentHint:
-    """Verify _build_job_prompt always injects [SILENT] guidance."""
+    """Verify _build_job_prompt always injects delivery-mode guidance.
+
+    The hint is delivery-mode-aware (see tests/cron/
+    test_cron_delivery_mode_hint.py): auto-delivering jobs get the
+    auto-delivery + [SILENT] wording; deliver=local jobs (including jobs
+    with no deliver key — local is the scheduler default) are told their
+    output is archived only and sends must be explicit.
+    """
 
     def test_hint_always_present(self):
-        job = {"prompt": "Check for updates"}
+        job = {"prompt": "Check for updates", "deliver": "origin"}
         result = _build_job_prompt(job)
         assert "[SILENT]" in result
         assert "Check for updates" in result
 
     def test_hint_present_even_without_prompt(self):
-        job = {"prompt": ""}
+        job = {"prompt": "", "deliver": "origin"}
         result = _build_job_prompt(job)
         assert "[SILENT]" in result
 
     def test_hint_present_when_legacy_prompt_is_null(self):
-        job = {"id": "abc123deadbe", "name": None, "prompt": None}
+        job = {"id": "abc123deadbe", "name": None, "prompt": None, "deliver": "origin"}
         result = _build_job_prompt(job)
         assert "[SILENT]" in result
 
     def test_delivery_guidance_present(self):
-        """Cron hint tells agents their final response is auto-delivered."""
-        job = {"prompt": "Generate a report"}
+        """Auto-deliver cron hint says the final response is auto-delivered."""
+        job = {"prompt": "Generate a report", "deliver": "origin"}
         result = _build_job_prompt(job)
         assert "do NOT use send_message" in result
         assert "automatically delivered" in result
 
+    def test_local_delivery_guidance_present(self):
+        """Jobs without a deliver key default to local: archived only."""
+        job = {"prompt": "Generate a report"}
+        result = _build_job_prompt(job)
+        assert "NOT delivered" in result
+        assert "automatically delivered" not in result
+        assert "do NOT use send_message" not in result
+
     def test_delivery_guidance_precedes_user_prompt(self):
         """System guidance appears before the user's prompt text."""
-        job = {"prompt": "My custom prompt"}
+        job = {"prompt": "My custom prompt", "deliver": "origin"}
         result = _build_job_prompt(job)
         system_pos = result.index("do NOT use send_message")
         prompt_pos = result.index("My custom prompt")

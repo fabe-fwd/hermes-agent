@@ -63,6 +63,32 @@ def _ra():
     return run_agent
 
 
+def _default_platform_hint(agent: Any, platform_key: str) -> str:
+    """Resolve the built-in/plugin default hint for *platform_key*.
+
+    Cron is special-cased: the correct hint depends on the job's delivery
+    mode, which the cron scheduler stamps on the agent as
+    ``_cron_deliver_mode`` (a normalized ``deliver`` value). Without the
+    stamp the mode-less neutral cron hint is used — never the auto-delivery
+    wording, which is false for ``deliver=local`` jobs.
+    """
+    if platform_key == "cron":
+        from agent.prompt_builder import cron_platform_hint
+        return cron_platform_hint(getattr(agent, "_cron_deliver_mode", None))
+    if platform_key in PLATFORM_HINTS:
+        return PLATFORM_HINTS[platform_key]
+    if platform_key:
+        # Check plugin registry for platform-specific LLM guidance
+        try:
+            from gateway.platform_registry import platform_registry
+            _entry = platform_registry.get(platform_key)
+            if _entry and _entry.platform_hint:
+                return _entry.platform_hint
+        except Exception:
+            pass
+    return ""
+
+
 def _resolve_platform_hint(agent: Any, platform_key: str, default_hint: str) -> str:
     """Apply a per-platform prompt-hint override to the default hint.
 
@@ -416,18 +442,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     platform_key = (agent.platform or "").lower().strip()
     # Resolve the built-in/plugin default hint for this platform, then apply
     # any per-platform override from config (platform_hints.<platform>).
-    _default_hint = ""
-    if platform_key in PLATFORM_HINTS:
-        _default_hint = PLATFORM_HINTS[platform_key]
-    elif platform_key:
-        # Check plugin registry for platform-specific LLM guidance
-        try:
-            from gateway.platform_registry import platform_registry
-            _entry = platform_registry.get(platform_key)
-            if _entry and _entry.platform_hint:
-                _default_hint = _entry.platform_hint
-        except Exception:
-            pass
+    _default_hint = _default_platform_hint(agent, platform_key)
 
     _effective_hint = _resolve_platform_hint(agent, platform_key, _default_hint)
     if platform_key == "tui" and _effective_hint:

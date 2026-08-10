@@ -713,12 +713,17 @@ PLATFORM_HINTS = {
         "is preserved for threading. Do not include greetings or sign-offs unless "
         "contextually appropriate."
     ),
+    # NOTE: the cron hint depends on the job's delivery mode — resolve it via
+    # cron_platform_hint(deliver) whenever the mode is known. This dict entry
+    # is the mode-less fallback and must not claim either delivery behavior:
+    # a deliver=local job that is (falsely) promised automatic delivery will
+    # skip the explicit sends its prompt requires (fleet incident 2026-08-04).
     "cron": (
         "You are running as a scheduled cron job. There is no user present — you "
         "cannot ask questions, request clarification, or wait for follow-up. Execute "
         "the task fully and autonomously, making reasonable decisions where needed. "
-        "Your final response is automatically delivered to the job's configured "
-        "destination — put the primary content directly in your response."
+        "Whether your final response is delivered anywhere depends on the job's "
+        "deliver setting — follow the delivery guidance in your task prompt."
     ),
     "cli": (
         "You are a CLI AI Agent. Try not to use markdown but simple text "
@@ -864,6 +869,42 @@ PLATFORM_HINTS = {
         "Use MEDIA:/absolute/path instead."
     ),
 }
+
+
+def cron_platform_hint(deliver: Optional[str] = None) -> str:
+    """Return the cron platform hint for a job's delivery mode.
+
+    ``deliver`` is the job's normalized deliver value (``"local"``,
+    ``"origin"``, a platform target like ``"slack"``/``"telegram:-100:7"``,
+    or ``"all"``). ``None``/empty means the mode is unknown at this call
+    site and yields the neutral ``PLATFORM_HINTS["cron"]`` fallback.
+
+    A ``deliver=local`` job's final response is archived to the job output
+    directory and delivered nowhere, so the hint must demand explicit sends;
+    every other mode auto-delivers the final response.
+    """
+    base = (
+        "You are running as a scheduled cron job. There is no user present — you "
+        "cannot ask questions, request clarification, or wait for follow-up. Execute "
+        "the task fully and autonomously, making reasonable decisions where needed. "
+    )
+    mode = (deliver or "").strip().lower()
+    if not mode:
+        return PLATFORM_HINTS["cron"]
+    if mode == "local":
+        return base + (
+            "This job runs with deliver=local: your final response is archived "
+            "to the job's output directory only and is NOT delivered to any "
+            "chat, channel, or user. If this job's instructions require sending "
+            "a message or report anywhere, you must perform that send yourself "
+            "with the appropriate tool before finishing — your final response "
+            "alone will not reach anyone."
+        )
+    return base + (
+        "Your final response is automatically delivered to the job's configured "
+        "destination — put the primary content directly in your response."
+    )
+
 
 # ---------------------------------------------------------------------------
 # Environment hints — execution-environment awareness for the agent.
