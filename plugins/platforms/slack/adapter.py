@@ -597,6 +597,39 @@ class SlackAdapter(BasePlatformAdapter):
     _sdk_reap_rounds = 6
     _sdk_reap_round_wait_s = 0.1
 
+    def _sdk_client_tasks(self, client: Any) -> set[asyncio.Future]:
+        """Find both SDK-tracked futures and orphaned tasks bound to a client.
+
+        slack_sdk replaces ``current_session_monitor`` when a reconnect makes a
+        new session. If the previous monitor swallowed its cancellation while
+        inside ``connect()``, that old task keeps running but is no longer
+        reachable through any SDK attribute. Its suspended coroutine frame
+        still owns the old client as ``self``, which gives us a narrow way to
+        find it without touching unrelated gateway tasks.
+        """
+        current = asyncio.current_task()
+        tasks: set[asyncio.Future] = {
+            fut
+            for fut in (
+                getattr(client, name, None) for name in self._SDK_INTERNAL_FUTURES
+            )
+            if isinstance(fut, asyncio.Future) and not fut.done()
+        }
+        for task in asyncio.all_tasks():
+            if task is current or task.done():
+                continue
+            try:
+                frames = task.get_stack()
+            except Exception:  # pragma: no cover - foreign task implementation
+                continue
+            if any(
+                value is client
+                for frame in frames
+                for value in frame.f_locals.values()
+            ):
+                tasks.add(task)
+        return tasks
+
     async def _reap_sdk_client_tasks(self, client: Any) -> None:
         """Force a stopped SDK client's internal tasks dead (incident 20260803T185201Z).
 
@@ -628,20 +661,15 @@ class SlackAdapter(BasePlatformAdapter):
             except Exception:  # pragma: no cover - foreign client object
                 pass
 
-        pending = [
-            fut
-            for fut in (
-                getattr(client, name, None) for name in self._SDK_INTERNAL_FUTURES
-            )
-            if isinstance(fut, asyncio.Future) and not fut.done()
-        ]
+        pending = self._sdk_client_tasks(client)
         for _ in range(self._sdk_reap_rounds):
             if not pending:
                 return
             for fut in pending:
                 fut.cancel()
             await asyncio.wait(set(pending), timeout=self._sdk_reap_round_wait_s)
-            pending = [fut for fut in pending if not fut.done()]
+            pending = {fut for fut in pending if not fut.done()}
+            pending.update(self._sdk_client_tasks(client))
         if pending:
             logger.warning(
                 "[Slack] %d SDK task(s) survived handler close and repeated "

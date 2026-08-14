@@ -954,6 +954,59 @@ class TestSlackReconnectRobustness:
                 await asyncio.wait({monitor}, timeout=0.05)
 
     @pytest.mark.asyncio
+    async def test_stop_handler_reaps_orphaned_sdk_monitor(self):
+        """A superseded SDK monitor can swallow cancellation, reconnect, and
+        then lose its last SDK attribute when the client stores a replacement.
+        The old task still has the client in its coroutine frame and must be
+        reaped even though all three tracked future attributes point elsewhere.
+
+        This is the exact gap left by the first zombie-task fix and reproduced
+        by Oracle incident 20260814T034601Z.
+        """
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._running = True
+        sdk_client = MagicMock()
+        sdk_client.closed = False
+        sdk_client.auto_reconnect_enabled = True
+        sdk_client.default_auto_reconnect_enabled = True
+        sdk_client.current_session_monitor = None
+        sdk_client.message_receiver = None
+        sdk_client.message_processor = None
+
+        async def orphaned_monitor(client):
+            swallowed_once = False
+            while True:
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    if not swallowed_once:
+                        swallowed_once = True
+                        continue
+                    raise
+
+        orphan = asyncio.get_event_loop().create_task(orphaned_monitor(sdk_client))
+        await asyncio.sleep(0)
+
+        handler = MagicMock()
+        handler.client = sdk_client
+        handler.close_async = AsyncMock()
+        adapter._handler = handler
+        adapter._socket_mode_task = None
+
+        try:
+            await asyncio.wait_for(adapter._stop_socket_mode_handler(), timeout=5.0)
+            assert orphan.done(), (
+                "orphaned SDK monitor survived handler stop and would keep "
+                "retrying the closed session"
+            )
+        finally:
+            for _ in range(10):
+                if orphan.done():
+                    break
+                orphan.cancel()
+                await asyncio.wait({orphan}, timeout=0.05)
+
+    @pytest.mark.asyncio
     async def test_watchdog_logs_slack_connected_marker_after_reconnect(
         self, caplog
     ):
